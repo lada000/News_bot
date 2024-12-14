@@ -2,12 +2,11 @@ package source
 
 import (
 	"context"
+	"news-feed-bot/internal/model"
 	"strings"
 
 	"github.com/SlyMarbo/rss"
 	"github.com/samber/lo"
-
-	"github.com/defer-panic/news-feed-bot/internal/model"
 )
 
 type RSSSource struct {
