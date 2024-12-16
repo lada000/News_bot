@@ -9,8 +9,8 @@ import (
 
 	"go.tomakado.io/containers/set"
 
-	"github.com/defer-panic/news-feed-bot/internal/model"
-	src "github.com/defer-panic/news-feed-bot/internal/source"
+	"news-feed-bot/internal/model"
+	src "news-feed-bot/internal/source"
 )
 
 //go:generate moq --out=mocks/mock_article_storage.go --pkg=mocks . ArticleStorage

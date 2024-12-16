@@ -1,145 +1,151 @@
-package main
+package notifier
 
 import (
 	"context"
-	"errors"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
-	"os"
-	"os/signal"
-	"syscall"
+	"regexp"
+	"strings"
+	"time"
 
+	"github.com/go-shiori/go-readability"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"github.com/jmoiron/sqlx"
-	_ "github.com/lib/pq"
 
-	"github.com/defer-panic/news-feed-bot/internal/bot"
-	"github.com/defer-panic/news-feed-bot/internal/bot/middleware"
-	"github.com/defer-panic/news-feed-bot/internal/botkit"
-	"github.com/defer-panic/news-feed-bot/internal/config"
-	"github.com/defer-panic/news-feed-bot/internal/fetcher"
-	"github.com/defer-panic/news-feed-bot/internal/notifier"
-	"github.com/defer-panic/news-feed-bot/internal/storage"
-	"github.com/defer-panic/news-feed-bot/internal/summary"
+	"news-feed-bot/internal/botkit/markup"
+	"news-feed-bot/internal/model"
 )
 
-func main() {
-	botAPI, err := tgbotapi.NewBotAPI(config.Get().TelegramBotToken)
+type ArticleProvider interface {
+	AllNotPosted(ctx context.Context, since time.Time, limit uint64) ([]model.Article, error)
+	MarkAsPosted(ctx context.Context, article model.Article) error
+}
+
+type Summarizer interface {
+	Summarize(text string) (string, error)
+}
+
+type Notifier struct {
+	articles         ArticleProvider
+	summarizer       Summarizer
+	bot              *tgbotapi.BotAPI
+	sendInterval     time.Duration
+	lookupTimeWindow time.Duration
+	channelID        int64
+}
+
+func New(
+	articleProvider ArticleProvider,
+	summarizer Summarizer,
+	bot *tgbotapi.BotAPI,
+	sendInterval time.Duration,
+	lookupTimeWindow time.Duration,
+	channelID int64,
+) *Notifier {
+	return &Notifier{
+		articles:         articleProvider,
+		summarizer:       summarizer,
+		bot:              bot,
+		sendInterval:     sendInterval,
+		lookupTimeWindow: lookupTimeWindow,
+		channelID:        channelID,
+	}
+}
+
+func (n *Notifier) Start(ctx context.Context) error {
+	ticker := time.NewTicker(n.sendInterval)
+	defer ticker.Stop()
+
+	if err := n.SelectAndSendArticle(ctx); err != nil {
+		return err
+	}
+
+	for {
+		select {
+		case <-ticker.C:
+			if err := n.SelectAndSendArticle(ctx); err != nil {
+				return err
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (n *Notifier) SelectAndSendArticle(ctx context.Context) error {
+	topOneArticles, err := n.articles.AllNotPosted(ctx, time.Now().Add(-n.lookupTimeWindow), 1)
 	if err != nil {
-		log.Printf("[ERROR] failed to create botAPI: %v", err)
-		return
+		return err
 	}
 
-	db, err := sqlx.Connect("postgres", config.Get().DatabaseDSN)
+	if len(topOneArticles) == 0 {
+		return nil
+	}
+
+	article := topOneArticles[0]
+
+	summary, err := n.extractSummary(article)
 	if err != nil {
-		log.Printf("[ERROR] failed to connect to db: %v", err)
-		return
+		log.Printf("[ERROR] failed to extract summary: %v", err)
 	}
-	defer db.Close()
 
-	var (
-		articleStorage = storage.NewArticleStorage(db)
-		sourceStorage  = storage.NewSourceStorage(db)
-		fetcher        = fetcher.New(
-			articleStorage,
-			sourceStorage,
-			config.Get().FetchInterval,
-			config.Get().FilterKeywords,
-		)
-		summarizer = summary.NewOpenAISummarizer(
-			config.Get().OpenAIKey,
-			config.Get().OpenAIModel,
-			config.Get().OpenAIPrompt,
-		)
-		notifier = notifier.New(
-			articleStorage,
-			summarizer,
-			botAPI,
-			config.Get().NotificationInterval,
-			2*config.Get().FetchInterval,
-			config.Get().TelegramChannelID,
-		)
-	)
-
-	newsBot := botkit.New(botAPI)
-	newsBot.RegisterCmdView(
-		"addsource",
-		middleware.AdminsOnly(
-			config.Get().TelegramChannelID,
-			bot.ViewCmdAddSource(sourceStorage),
-		),
-	)
-	newsBot.RegisterCmdView(
-		"setpriority",
-		middleware.AdminsOnly(
-			config.Get().TelegramChannelID,
-			bot.ViewCmdSetPriority(sourceStorage),
-		),
-	)
-	newsBot.RegisterCmdView(
-		"getsource",
-		middleware.AdminsOnly(
-			config.Get().TelegramChannelID,
-			bot.ViewCmdGetSource(sourceStorage),
-		),
-	)
-	newsBot.RegisterCmdView(
-		"listsources",
-		middleware.AdminsOnly(
-			config.Get().TelegramChannelID,
-			bot.ViewCmdListSource(sourceStorage),
-		),
-	)
-	newsBot.RegisterCmdView(
-		"deletesource",
-		middleware.AdminsOnly(
-			config.Get().TelegramChannelID,
-			bot.ViewCmdDeleteSource(sourceStorage),
-		),
-	)
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
-
-	go func(ctx context.Context) {
-		if err := fetcher.Start(ctx); err != nil {
-			if !errors.Is(err, context.Canceled) {
-				log.Printf("[ERROR] failed to run fetcher: %v", err)
-				return
-			}
-
-			log.Printf("[INFO] fetcher stopped")
-		}
-	}(ctx)
-
-	go func(ctx context.Context) {
-		if err := notifier.Start(ctx); err != nil {
-			if !errors.Is(err, context.Canceled) {
-				log.Printf("[ERROR] failed to run notifier: %v", err)
-				return
-			}
-
-			log.Printf("[INFO] notifier stopped")
-		}
-	}(ctx)
-
-	go func(ctx context.Context) {
-		if err := http.ListenAndServe("9.0.0.0:8080", mux); err != nil {
-			if !errors.Is(err, context.Canceled) {
-				log.Printf("[ERROR] failed to run http server: %v", err)
-				return
-			}
-
-			log.Printf("[INFO] http server stopped")
-		}
-	}(ctx)
-
-	if err := newsBot.Run(ctx); err != nil {
-		log.Printf("[ERROR] failed to run botkit: %v", err)
+	if err := n.sendArticle(article, summary); err != nil {
+		return err
 	}
+
+	return n.articles.MarkAsPosted(ctx, article)
+}
+
+var redundantNewLines = regexp.MustCompile(`\n{3,}`)
+
+func (n *Notifier) extractSummary(article model.Article) (string, error) {
+	var r io.Reader
+
+	if article.Summary != "" {
+		r = strings.NewReader(article.Summary)
+	} else {
+		resp, err := http.Get(article.Link)
+		if err != nil {
+			return "", err
+		}
+		defer resp.Body.Close()
+
+		r = resp.Body
+	}
+
+	doc, err := readability.FromReader(r, nil)
+	if err != nil {
+		return "", err
+	}
+
+	summary, err := n.summarizer.Summarize(cleanupText(doc.TextContent))
+	if err != nil {
+		return "", err
+	}
+
+	return "\n\n" + summary, nil
+}
+
+func cleanupText(text string) string {
+	return redundantNewLines.ReplaceAllString(text, "\n")
+}
+
+func (n *Notifier) sendArticle(article model.Article, summary string) error {
+	const msgFormat = "*%s*%s\n\n%s"
+
+	msg := tgbotapi.NewMessage(n.channelID, fmt.Sprintf(
+		msgFormat,
+		markup.EscapeForMarkdown(article.Title),
+		markup.EscapeForMarkdown(summary),
+		markup.EscapeForMarkdown(article.Link),
+	))
+	msg.ParseMode = "MarkdownV2"
+
+	_, err := n.bot.Send(msg)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }

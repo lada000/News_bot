@@ -5,9 +5,6 @@ import (
 	"errors"
 	"log"
 	"net/http"
-	"news-feed-bot/internal/config"
-	"news-feed-bot/internal/fetcher"
-	"news-feed-bot/internal/storage"
 	"os"
 	"os/signal"
 	"syscall"
@@ -15,6 +12,15 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/jmoiron/sqlx"
 	_ "github.com/lib/pq"
+
+	"news-feed-bot/internal/bot"
+	"news-feed-bot/internal/bot/middleware"
+	"news-feed-bot/internal/botkit"
+	"news-feed-bot/internal/config"
+	"news-feed-bot/internal/fetcher"
+	"news-feed-bot/internal/notifier"
+	"news-feed-bot/internal/storage"
+	"news-feed-bot/internal/summary"
 )
 
 func main() {
@@ -61,13 +67,6 @@ func main() {
 		middleware.AdminsOnly(
 			config.Get().TelegramChannelID,
 			bot.ViewCmdAddSource(sourceStorage),
-		),
-	)
-	newsBot.RegisterCmdView(
-		"setpriority",
-		middleware.AdminsOnly(
-			config.Get().TelegramChannelID,
-			bot.ViewCmdSetPriority(sourceStorage),
 		),
 	)
 	newsBot.RegisterCmdView(
