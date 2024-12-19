@@ -63,6 +63,14 @@ func main() {
 
 	newsBot := botkit.New(botAPI)
 	newsBot.RegisterCmdView(
+		"start",
+		middleware.AdminsOnly(
+			config.Get().TelegramChannelID,
+			bot.ViewCmdAddSource(sourceStorage),
+		),
+	)
+
+	newsBot.RegisterCmdView(
 		"addsource",
 		middleware.AdminsOnly(
 			config.Get().TelegramChannelID,
